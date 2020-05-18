@@ -1,0 +1,1320 @@
+---
+title: "Transcriptional response to COVID-19 infection"
+author: "Bernardo Carraro Detanico"
+date: "18 May 2020"
+output:
+  html_document:
+      toc: yes
+      toc_depth: 2
+      code_folding: hide
+      theme: paper
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r echo=FALSE}
+setwd("C:/Users/bdeta/Documents/Projects/R/5 - RNAseq")
+```
+
+## 1. Introduction
+
+The new coronavirus disease (COVID-19), caused by the severe acute respiratory syndrome coronavirus 2 (SARS-CoV-2), has quickly become a global health emergency.
+
+> Scientists are working around the clock to understand the biology of the SARS-CoV-2 and how infected human cells respond to it.
+
+In this context, the current project analysed the transcriptional response to SARS-CoV-2 infection using RNA-sequencing data from a cell model of SARS-CoV-2 infection and COVID-19 lung biopsy from *post mortem* COVID-19 patient. The data, obtained from Gene Expression Omnibus (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE147507), came from the paper: *Daniel Blanco-Melo, Benjamin E. Nilsson-Payant, Wen-Chun Liu, Rasmus Møller, Maryline Panis, David Sachs, Randy A. Albrecht, Benjamin R. tenOever. **SARS-CoV-2 launches a unique transcriptional signature from in vitro, ex vivo, and in vivo systems**. bioRxiv 2020.03.24.004655*.
+
+## 2. Loading packages
+```{r packages, echo=TRUE}
+library(tidyverse)
+library(GEOquery)
+library(dplyr)
+library(DESeq2)
+library(pheatmap)
+library(gridExtra)
+library(grid)
+library(formattable)
+library(ggrepel)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+library(DOSE)
+library(pathview)
+```
+
+## 3. Reading files
+```{r}
+matrix <- getGEO(filename="GSE147507-GPL18573_series_matrix.txt")
+matrix <- pData(matrix)[1:69,]
+
+data_raw <- read.csv(file = 'GSE147507_RawReadCounts_Human.tsv', header = TRUE, sep = "\t", row.names="X")
+
+head(data_raw, 2)
+```
+This is the read counts associated with genes. The count data used for differential expression analysis represent the number of sequence reads that originated from a particular gene. The higher the number of counts, the more reads associated with that gene, and the assumption that there is a higher level of expression of that gene in the sample.
+\
+
+## 4. Selecting the data
+The data were cleaned in order to keep only the series of interest:
+       
+- NHBE cells (primary human bronchial epithelial cells) infected with SARS-CoV-2, and NHBE cells control (mock treated).       
+
+- Lung biopsy sample from *post mortem* COVID-19 patient, and healthy negative control patient.  
+```{r}
+keep.list <- paste(c("Series1", "Series15"), collapse = '|')
+#remove.list <- c(1:6, 25:28)
+
+data_raw <- data_raw[, grepl(keep.list, colnames(data_raw))]
+#data_raw <- data_raw[, remove.list]
+matrix <- matrix[grepl(keep.list, matrix$title),]
+#matrix <- matrix[remove.list,]
+```
+
+After selecting the data, the project analysed 2 series of experiments, each one composed of control and infected groups, as detailed below:
+```{r}
+unique(matrix$source_name_ch1)
+```
+\
+
+## 5. Determining the statistical model
+
+To determine the appropriate statistical model, the distribution of counts analysis is mandatory. As an example, the "Mock treated NHBE cells" and  "Lung biopsy for healthy negative control" groups were chosen.
+     
+     
+```{r}
+ggplot(data_raw, aes(x = Series1_NHBE_Mock_1)) +
+  geom_histogram(stat = "bin", bins = 150, color = "#08519c", fill = "#6baed6") + 
+  xlim(-2, 300) +
+  xlab("Raw expression counts") +
+  ylab("Number of genes") +
+  theme_minimal() +
+  ggtitle("Counts distribution of Mock treated NHBE cells") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+     
+     
+     
+```{r}
+ggplot(data_raw, aes(x = Series15_HealthyLungBiopsy_2)) +
+  geom_histogram(position="identity", stat = "bin", bins = 150, color = "#238b45", fill = "#a1d99b") + 
+  xlim(-2, 300) +
+  xlab("Raw expression counts") +
+  ylab("Number of genes") +
+  theme_minimal() +
+  ggtitle("Counts distribution of lung biopsy for healthy negative control") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+\
+\
+     
+- Both plots illustrate a common feature of RNA-seq count data: **a low number of counts associated with a large proportion of genes, and a long right tail**. 
+\
+\
+\
+      
+Additionally, to choose the appropriate statistical model, it can be helpful to plot the mean versus the variance of the data.
+     
+     
+```{r}
+# Mean-variance relationship
+control_col <- c(1, 2, 3)
+infected_col <- c(4, 5, 6)
+
+# Calculating mean for each gene (each row)
+mean_counts_c <- apply(data_raw[, control_col], 1, mean) # control
+mean_counts_i <- apply(data_raw[, infected_col], 1, mean) # infected
+ 
+# Calculating variance for each gene 
+var_counts_c <- apply(data_raw[, control_col], 1, var) # control
+var_counts_i <- apply(data_raw[, infected_col], 1, var) # infected
+
+# Creating data frame with mean and variance for every gene
+df_c <- data.frame(mean_counts_c, var_counts_c)
+ 
+p1 <- ggplot(df_c) +
+        geom_point(aes(x=mean_counts_c, y=var_counts_c), size = 1, alpha = 1/5, color = "#a6cee3") +
+        geom_line(aes(x=mean_counts_i, y=mean_counts_i, color="red")) +
+        scale_y_log10() +
+        scale_x_log10() +
+        xlab("Mean counts per gene (control group)") +
+        ylab("Variance per gene (control group)") +
+        theme_minimal() +
+        theme(legend.position="none")
+
+
+df_i <- data.frame(mean_counts_i, var_counts_i)
+ 
+p2 <- ggplot(df_i) +
+        geom_point(aes(x=mean_counts_i, y=var_counts_i), size = 1, alpha = 1/5, color = "#1f78b4") +
+        geom_line(aes(x=mean_counts_i, y=mean_counts_i, color="red")) +
+        scale_y_log10() +
+        scale_x_log10() +
+        xlab("Mean counts per gene (infected group)") +
+        ylab("Variance per gene (infected group)") +
+        theme_minimal() +
+        theme(legend.position="none")
+
+grid.arrange(p1, p2, ncol=2, top = "Mean-variance relationship of NHBE cells (control and SARS-CoV-2 infected)")
+```
+\
+\
+     
+```{r}
+# Mean-variance relationship
+
+control_col <- c(7, 8)
+infected_col <- c(9, 10)
+
+# Calculating mean for each gene (each row)
+mean_counts_c <- apply(data_raw[, control_col], 1, mean) # control
+mean_counts_i <- apply(data_raw[, infected_col], 1, mean) # infected
+ 
+# Calculating variance for each gene 
+var_counts_c <- apply(data_raw[, control_col], 1, var) # control
+var_counts_i <- apply(data_raw[, infected_col], 1, var) # infected
+
+# Creating data frame with mean and variance for every gene
+df_c <- data.frame(mean_counts_c, var_counts_c)
+ 
+p1 <- ggplot(df_c) +
+        geom_point(aes(x=mean_counts_c, y=var_counts_c), size = 1, alpha = 1/5, color = "#fdbf6f") +
+        geom_line(aes(x=mean_counts_i, y=mean_counts_i, color="red")) +
+        scale_y_log10() +
+        scale_x_log10() +
+        xlab("Mean counts per gene  (control group)") +
+        ylab("Variance per gene  (control group)") +
+        theme_minimal() +
+        theme(legend.position="none")
+
+
+df_i <- data.frame(mean_counts_i, var_counts_i)
+ 
+p2 <- ggplot(df_i) +
+        geom_point(aes(x=mean_counts_i, y=var_counts_i), size = 1, alpha = 1/5, color = "#ff7f00") +
+        geom_line(aes(x=mean_counts_i, y=mean_counts_i, color="red")) +
+        scale_y_log10() +
+        scale_x_log10() +
+        xlab("Mean counts per gene (infected group)") +
+        ylab("Variance per gene (infected group)") +
+        theme_minimal() +
+        theme(legend.position="none")
+
+grid.arrange(p1, p2, ncol=2, top = "Mean-variance relationship of lung biopsy samples (healthy and COVID-19 patient)")
+```
+\
+\
+     
+     
+- All plots have a similar pattern: the variance across the replicates tends to be greater than the mean (<span style="color: red;"><b>red</b></span> line): $mean < variance$. Besides, the variation in gene expression increases with the mean. This is expected for RNA-seq data.
+\
+\
+      
+> This results (distribution of counts **AND** $mean < variance$) suggest that **the RNA-seq data can be modelled well using the negative binomial model**. Another option could be Poisson distribution model, however, a unique property of this distribution is that the $mean == variance$.
+
+\
+
+## 6. Differential expression analysis {.tabset .tabset-fade .tabset-pills}
+`DESeq2` package was used to model the raw counts using normalization factors for library size and RNA composition between samples. `DESeq2` uses the negative binomial model and perform hypothesis testing using the Wald test (also called the Wald Chi-Squared Test) or Likelihood Ratio Test.
+
+To compare counts for the same gene between different samples, it's needed to **normalize** the raw counts. `DESeq2` performs an internal normalization which geometric mean is calculated for each gene across all samples. The counts for a gene in each sample is then divided by this mean. The median of these ratios in a sample is the size factor for that sample. This procedure corrects for library size and RNA composition bias.
+
+
+Before creating `DESEq2` object, the **metadata table** was built.
+```{r}
+# Create type vector
+type <- matrix$`cell line:ch1`
+type[1:6] = "NHBE-Series1"
+type[is.na(type)] = "Lung biopsy-Series15"
+
+# Create condition vector
+condition <- matrix$source_name_ch1
+
+# Create data frame
+metadata <- data.frame(type, condition)
+
+# Assign the row names of the data frame
+rownames(metadata) <- matrix$title
+
+metadata
+```
+
+\
+\
+     
+     
+### **6.1. NHBE cells infected with SARS-CoV-2**
+- This section (**6.1.**) analyses the NHBE cells SARS-CoV-2 infected experiment. The section **6.2.** analyses the lung biopsy experiment.
+```{r}
+# Building the DESeq2 object
+remove.list <- paste(c("Series9", "Series15"), collapse = '|')
+dds_NHBE_Series1 <- DESeqDataSetFromMatrix(countData = data_raw[, !grepl(remove.list, colnames(data_raw))],
+                              colData = metadata[!grepl(remove.list, metadata$type),],
+                              design = ~ condition)
+
+
+head(counts(dds_NHBE_Series1)) #Counts
+```
+\
+
+     
+#### 6.1.1. Quality assessment
+This procedure checks the count data to ensure that the samples/replicates look good. For this purpose, hierarchical clustering (HC) and principal component analysis (PCA) methods were applied.
+
+```{r}
+dds <- estimateSizeFactors(dds_NHBE_Series1)
+#sizeFactors(dds)
+
+normalized_counts <- counts(dds, normalized=TRUE)
+```
+
+
+```{r, fig.width=9}
+dds_log <- vst(dds, blind=TRUE)
+dds_log_matrix <- assay(dds_log) # Matrix
+
+vsd_corr <- cor(dds_log_matrix)
+
+ann_colors = list(condition = c("Mock treated" = "#bababa", "SARS-CoV-2 infected" = "#878787"))
+
+metadata_n <- metadata
+metadata_n$condition <- gsub(' NHBE cells', '', metadata$condition)
+
+pheatmap(vsd_corr,
+         annotation = select(metadata_n, condition),
+         annotation_colors = ann_colors,
+         annotation_legend = TRUE,
+         main = "Hierarchical Clustering method \n for quality control")
+```
+\
+     
+- Overall, there are **high correlations across the board ( > 0.99), suggesting no outlying samples**. However, there are no well-defined clusters between control (mock) and infected (SARS-CoV-2) groups.
+```{r, fig.width=9}
+plotPCA(dds_log, intgroup = "condition") +
+  theme_minimal() +
+  ggtitle("Principal Component Analysis for quality control") +
+  theme(plot.title = element_text(hjust = 0.5), legend.title = element_blank())
+```
+     
+- The PC1 explains the most variation in the data (69% of variance). The control "cluster" and infected cluster are separated on PC1. It seems that a lot of variation in gene expression can be explained by conditions (control vs SARS-CoV-2 infected).
+\
+\
+       
+> Together, **these quality controls suggest that the data are of reasonable quality**.
+
+\
+\
+\
+      
+#### 6.1.2. Running DESeq2 - differential expression analysis
+```{r}
+dds_NHBE_Series1 <- DESeq(dds_NHBE_Series1)
+```
+The function `DESeq()` performed the following procedures:    
+- estimating size factors     
+- estimating dispersions     
+- gene-wise dispersion estimates     
+- mean-dispersion relationship     
+- final dispersion estimates     
+- fitting model and testing     
+\
+      
+      
+`DESeq2` model uses estimated dispersion to assess the variability in expression when modelling the counts. Each black dot represents a gene. Genes with low dispersion estimates are shrunken towards the curve.
+        
+```{r}
+plotDispEsts(dds_NHBE_Series1, main = "Estimated dispersion for each gene and the fitted dispersion curve")
+```
+     
+> The dispersion in gene expression decreases with increasing mean. The fit of the data to the model is good since the dispersions decrease with increasing mean and cluster around the maximum likelihood (ML) line. It's expected that the data scatter around the curve, with the dispersion decreasing with increasing mean expression levels.
+
+$$↑variation ⇒ ↑dispersion$$
+$$↑mean ⇒ ↓dispersion$$
+
+\
+\
+       
+As already commented, `DESeq2` uses a negative binomial distribution to model the RNA-seq counts, and the coefficients are the estimates for the log2 foldchanges for each sample group. **To generate more accurate log2 foldchange estimates (effect size), the `DESeq2` authors recommend “shrinking” the log fold-changes which is available in `DESeq2’s` `lfcShrink` function**. The unshrunken results (1) and shrunken results (2) were performed.
+```{r}
+dds_NHBE_Series1_result_1 <- results(dds_NHBE_Series1, 
+            contrast = c("condition", "SARS-CoV-2 infected NHBE cells", "Mock treated NHBE cells"),
+            alpha = 0.01)
+
+#coef(dds_NHBE)[1,]
+dds_NHBE_Series1_result_2 <- lfcShrink(dds_NHBE_Series1, 
+            coef= "condition_SARS.CoV.2.infected.NHBE.cells_vs_Mock.treated.NHBE.cells",
+            type="apeglm")
+```
+The `MA plot` can be useful to explore the results. The log2 fold change is plotted on the y-axis, the average of the counts normalized by size factor is shown on the x-axis. Each gene is represented with a dot, and the genes that are significantly differentially expressed are coloured <span style="color: blue;"><b>blue</b></span>.
+```{r}
+# The MA plot shows the mean of normalized count versus the log2 fold changes for all genes tested.
+plotMA(dds_NHBE_Series1_result_1, ylim=c(-5,5), main = "(1) MA plot for unshrunken results")
+plotMA(dds_NHBE_Series1_result_2, ylim=c(-5,5), main = "(2) MA plot for shrunken results")
+```
+    
+`MA plots` often display a fanning-effect at the left-hand side (genes with low numbers of counts) due to the high variability of the measurements for these genes. These plots demonstrate that only genes with a large average normalized count contain sufficient information to yield a significant call.
+
+> **The shrunken results (second plot) were more stable fold change values**. So, the shrunken results were used.
+
+\
+\
+      
+      
+#### 6.1.3. Results
+
+```{r}
+head(dds_NHBE_Series1_result_2)
+```
+- **baseMean:** average of the normalized count values, divided by size factors, taken over all samples. 
+- **log2FoldChange:** the effect size estimated, which is a measure describing how much the gene’s expression is different between control and infected groups. This value is reported as base 2 logarithmic scale. A log2 fold change of 1 ($\log2(FC) = 1$) means that the gene’s expression is increased by a multiplicative factor of $2^1 = 2$.
+- **lfcSE:** standard error estimated for the log2 fold change estimated.
+- **pvalue:** Wald test p-value for $p < 0.01$.
+- **padj:** false discovery rate (FDR)/Benjamini-Hochberg (BH) adjusted p-values, to control the false positives.
+
+
+```{r}
+summary(dds_NHBE_Series1_result_2)
+```
+> The result was **595 (sum of LFC: log2 fold changes) genes with differential expression** of a total of 16360 with non-zero total read count. This summary represents the number of genes that were considered up- and down-regulated according to the Wald test.
+
+\
+\
+      
+Using any cut-off (padj and/or threshold values) can be helpful when dealing with large numbers of differentially expressed genes. However, it increases the risk of losing biologically relevant gene. 
+
+- By specifying a threshold equal to 1 for log2 fold change values ($\log2(FC) = 1$), then $foldchange = 2^1$ between infected and control groups for gene counts. The infected group count is twice as big as control (infected is 200% of control).
+
+- If ($\log2(FC) = -1$), then $Fold Change = 2^{-1}$ between infected and control groups for gene counts. The infected group count is half as big as control (infected is 50% of control).
+
+```{r}
+dds_NHBE_Series1_result_2_ <- dds_NHBE_Series1_result_2 %>%
+  data.frame() %>%
+  rownames_to_column(var="gene")
+
+dds_NHBE_Series1_result_2_sig <- dds_NHBE_Series1_result_2_ %>%
+        filter(padj < 0.01 & abs(log2FoldChange) > 1)
+
+nrow(dds_NHBE_Series1_result_2_sig)
+```
+> After applying the cut-offs $padj < 0.01$ & $abs(log2FoldChange) > 1$, **the number of significant differentially expressed genes was 82.**
+
+\
+     
+     
+```{r}
+NHBE_Series1_result <- dds_NHBE_Series1_result_2_sig[order(dds_NHBE_Series1_result_2_sig$padj),]
+rownames(NHBE_Series1_result) <- NULL
+as.datatable(formattable(NHBE_Series1_result,
+                         list(
+                           log2FoldChange = color_tile("#ffffff", "#6baed6"),
+                           padj = color_tile("#74c476", "#e5f5e0"),
+                           `gene` = formatter(
+              "span", style = ~ style(color = "grey",font.weight = "bold")))))
+```
+     
+     
+```{r, fig.width=9}
+sig_norm_counts <- normalized_counts[NHBE_Series1_result$gene, ]
+
+select <- sig_norm_counts[1:82,]
+
+ann_colors = list(condition = c("Mock treated NHBE cells" = "#bababa", "SARS-CoV-2 infected NHBE cells" = "#878787"))
+pheatmap(select, 
+         cluster_rows = FALSE, 
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         border_color = NA,
+         annotation = select(metadata, condition),
+         annotation_colors = ann_colors,
+         scale = "row",
+         main = "Differential expression of the significant genes \n on NHBE cells SARS-CoV-2 infected")
+```
+
+```{r eval=FALSE, fig.width=9, include=FALSE}
+sig_norm_counts <- normalized_counts[NHBE_Series1_result$gene, ]
+
+select <- sig_norm_counts[1:20,]
+
+ann_colors = list(condition = c("Mock treated NHBE cells" = "#bababa", "SARS-CoV-2 infected NHBE cells" = "#878787"))
+p1 <- pheatmap(select, 
+         cluster_rows = FALSE, 
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         border_color = NA,
+         annotation = select(metadata, condition),
+         annotation_colors = ann_colors,
+         scale = "row",
+         main = "Differential expression of the \n top 20 significant genes")
+```
+\
+\
+     
+
+```{r, fig.width=9}
+# Expression plot
+sig_norm_counts <- normalized_counts[NHBE_Series1_result$gene, ]
+
+select <- sig_norm_counts[1:20,]
+top_20 <- as.data.frame(select) %>%
+        rownames_to_column(var = "gene")
+top_20 <- gather(top_20, 
+                 key = "samplename", 
+                 value = "normalized_counts", 
+                 2:7)
+top_20 <- inner_join(top_20,      rownames_to_column(metadata, var = "samplename"),
+                     by = "samplename")
+ 
+ggplot(top_20) +
+        geom_point(aes(x = gene, y = normalized_counts, color = condition), alpha = 0.5) +
+        scale_y_log10() +
+        xlab("Genes") +
+        ylab("Normalized Counts") +
+        ggtitle("Differential expression of the top 20 significant genes") +
+        scale_color_manual(values=c("#3288bd", "#f46d43")) +      
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        theme(plot.title = element_text(hjust = 0.5), legend.position = 'bottom', legend.title = element_blank())
+```
+\
+\
+\
+     
+     
+     
+The `volcano plot` shows the log-transformed adjusted p-values plotted on the y-axis and log2 fold change values on the x-axis. This plot displays a global view of the gene expression levels.
+```{r, fig.width=9}
+# Obtain logical vector regarding whether padj values are less than 0.01 and up/down regulated genes. 
+dds_NHBE_Series1_result_2_p <- dds_NHBE_Series1_result_2_ %>%
+              drop_na() %>%
+              mutate(threshold = ifelse(padj < 0.01 & log2FoldChange >= 1, "Sig and Up-regulated", ifelse(padj < 0.01 & log2FoldChange <= -1, "Sig and Down-regulated", "Not Sig"))) %>% mutate(genelabels = "")
+
+dds_NHBE_Series1_result_2_p <- dds_NHBE_Series1_result_2_p[order(dds_NHBE_Series1_result_2_p$padj),]
+dds_NHBE_Series1_result_2_p$genelabels[1:20] <- dds_NHBE_Series1_result_2_p$gene[1:20]
+
+ggplot(dds_NHBE_Series1_result_2_p, aes(x = log2FoldChange, y = -log10(padj), color = threshold)) +
+        geom_point(alpha=0.4, size=1.75) +
+        geom_text_repel(aes(label = genelabels)) +
+        xlab("log2 fold change") + 
+        ylab("-log10 adjusted p-value") +
+        theme(axis.title = element_text(size = rel(1.25))) +
+        theme_minimal() +
+        ggtitle("Volcano plot: adjusted p-values vs log2 fold change") +
+        theme(legend.position = 'bottom', legend.title = element_blank(), plot.title = element_text(hjust = 0.5))
+        
+```
+     
+> The `volcano plot` highlighted significant differentially expressed genes down-regulated (<span style="color: green;"><b>green</b></span>) and up-regulated (<span style="color: blue;"><b>blue</b></span>). The non-significant genes are coloured <span style="color: red;"><b>red</b></span>.
+
+\
+\
+     
+```{r}
+count_results <- dds_NHBE_Series1_result_2_p %>%
+     group_by(threshold) %>% 
+     summarise(count = n())
+
+ggplot(count_results, aes(x=threshold, y=count)) +
+  geom_bar(aes(fill=threshold), stat = 'identity', alpha = 0.7, width = 0.4) +
+  geom_text(aes(label=count), vjust=-0.5, color="black", size=3.2) +
+  ggtitle("Count of differentially expressed genes") +
+  theme_minimal() +
+    theme(legend.title = element_blank(), plot.title =
+          element_text(hjust = 0.5), axis.title.x = element_blank())
+```
+     
+> The output of RNA-seq differential expression analysis is a list of significant differentially expressed genes. In this analysis, in which was explored the differential expression in NHBE cells infected with SARS-CoV-2, **82 significant differentially expressed genes** (<span style="color: green;"><b>7 down-regulated</b></span> and <span style="color: blue;"><b>75 up-regulated</b></span>) were identified.
+
+\
+\
+       
+        
+#### 6.1.4. Functional Analysis
+
+To gain greater biological insight into the list of differentially expressed genes, it is helpful to perform the functional analysis. The two commonly used enrichment methods are: Over-Representation Analysis (ORA); and Gene Set Enrichment Analysis (GSEA).
+
+To perform the functional analysis, the Gene Ontology (GO) and Kyoto Encyclopedia of Genes and Genomes (KEGG) were used for the enrichment analysis to identify biological processes and pathways.
+       
+- Gene ontology (GO) provides a controlled vocabulary for describing biological processes, molecular functions and cellular components.
+     
+- KEGG groups genes into "pathways" representing molecular interaction and reaction networks, which are lists of genes participating in the same biological process.
+```{r include=FALSE}
+#PREPARING THE DATA
+dds_NHBE_results <- dds_NHBE_Series1_result_2 %>%
+  data.frame() %>%
+  rownames_to_column(var="gene")
+
+ensembl = useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+
+grch_genes <- getBM(attributes=c("ensembl_gene_id", "hgnc_symbol", "entrezgene_id", "description"), mart = ensembl)
+names(grch_genes)[2] <- "gene"
+
+dds_NHBE_results <- left_join(x = dds_NHBE_results, 
+                    y = grch_genes[, c("ensembl_gene_id", "gene", "entrezgene_id", "description")], 
+                    by = "gene")
+
+dds_NHBE_results <- dds_NHBE_results[!duplicated(dds_NHBE_results$gene),]
+
+dds_NHBE_results <- dds_NHBE_results[!duplicated(dds_NHBE_results$entrezgene_id),]
+
+dds_NHBE_results <- dds_NHBE_results %>% # all results
+  drop_na()
+
+dds_NHBE_results_sig <- dplyr::filter(dds_NHBE_results, padj < 0.01 & abs(log2FoldChange) > 1) # significant results and log2FoldChange threshold
+
+## EXTRACTING THE FOLD CHANGES FOR GO ANALYSIS
+# FOR ALL RESULTS WITH GENE ID
+foldchanges_gene <- dds_NHBE_results$log2FoldChange
+names(foldchanges_gene) <- dds_NHBE_results$ensembl_gene_id
+foldchanges_gene <- sort(foldchanges_gene, decreasing = TRUE)
+
+# FOR SIGNIFICANT RESULTS WITH GENE ID
+foldchanges_gene_sig <- dds_NHBE_results_sig$log2FoldChange
+names(foldchanges_gene_sig) <- dds_NHBE_results_sig$ensembl_gene_id
+foldchanges_gene_sig <- sort(foldchanges_gene_sig, decreasing = TRUE)
+
+## EXTRACTING THE FOLD CHANGES FOR KEGG ANALYSIS
+# FOR ALL RESULTS WITH ENTREZ ID
+foldchanges_ent <- dds_NHBE_results$log2FoldChange
+names(foldchanges_ent) <- dds_NHBE_results$entrezgene_id
+foldchanges_ent <- sort(foldchanges_ent, decreasing = TRUE)
+
+# FOR SIGNIFICANT RESULTS WITH ENTREZ ID
+foldchanges_ent_sig <- dds_NHBE_results_sig$log2FoldChange
+names(foldchanges_ent_sig) <- dds_NHBE_results_sig$entrezgene_id
+foldchanges_ent_sig <- sort(foldchanges_ent_sig, decreasing = TRUE)
+
+```
+\
+\
+       
+       
+##### 6.1.4.1. Over-representation analysis (ORA)
+It is an approach to determine whether a known biological functions/processes are over-represented (= enriched) in a list of differentially expressed genes.
+```{r}
+GO_NHBE <- enrichGO(gene = as.character(dds_NHBE_results_sig$ensembl_gene_id),
+                    universe = as.character(dds_NHBE_results$ensembl_gene_id),
+                    keyType = "ENSEMBL",
+                    OrgDb = org.Hs.eg.db, 
+                    ont = "BP",
+                    pAdjustMethod = "BH",
+                    pvalueCutoff = 0.01,
+                    qvalueCutoff = 0.1, 
+                    readable = TRUE)
+
+cluster_summary_GO <- data.frame(GO_NHBE)
+nrow(cluster_summary_GO)
+
+KEGG_NHBE <- enrichKEGG(gene=names(foldchanges_ent_sig),
+                        universe=names(foldchanges_ent),
+                        organism="hsa",
+                        pAdjustMethod = "BH",
+                        pvalueCutoff = 0.01,
+                        qvalueCutoff = 0.1,
+                        keyType = "ncbi-geneid")
+
+cluster_summary_KEGG <- data.frame(KEGG_NHBE)
+nrow(cluster_summary_KEGG)
+```
+> The GO functional enrichment analysis of differentially expressed genes resulted in **351 classes**. The ID GO:0006954, for example, is a class with the description: inflammatory response.
+       
+> The KEGG functional enrichment analysis returned **35 categories**. The ID hsa04060, for example, is a category with the description: Cytokine-cytokine receptor interaction.
+
+\
+\
+      
+The `dotplot` displays the top 20 GO and KEGG biological processes with the largest gene ratios (*number of differentially expressed genes related to GO term / total number of significant differentially expressed genes*). The size of the dots represent the number of genes in the significant differentially expressed gene list associated with the GO term and the colour of the dots represent the p-adjusted values.
+```{r, fig.width=12}
+p1 <- dotplot(GO_NHBE, showCategory = 20, title = "Gene Ontology", font.size = 8.5) + theme(plot.title = element_text(hjust = 0.5))
+
+p2 <- dotplot(KEGG_NHBE, 
+        showCategory = 20,
+        title = "KEGG",
+        font.size = 8.5) + theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2, ncol=2, top = textGrob("Biological processes related to NHBE cells SARS-CoV-2 infection", gp=gpar(fontsize=15)))
+
+
+```
+\
+\
+\
+        
+        
+The `heatplot` shows the GO functional enrichment analysis of differentially expressed genes. The colour of the squares represents the fold change values.
+
+```{r, fig.width=11, fig.height=4}
+heatplot(GO_NHBE, foldChange=foldchanges_gene_sig,showCategory = 20) + ggtitle("Gene expression on GO biological processes related to SARS-CoV-2 NHBE cells infection") + theme(plot.title = element_text(hjust = 0.5))
+```
+\
+\
+       
+       
+The `enrichment plot` shows the relationship between the significantly enriched GO terms by grouping similar terms together. The colour represents the p-adjusted values and the size of the terms represents the number of genes identified that are significant.
+     
+```{r, fig.width=11}
+emapplot(GO_NHBE, showCategory = 20, pie_scale=1.5,layout="kk", line_scale = 0.3) + ggtitle("Biological processes relationship between the significantly enriched GO terms") + theme(plot.title = element_text(hjust = 0.5))
+```
+\
+\
+\
+      
+      
+The `KEGG pathway map` is a molecular interaction/reaction network diagram represented in terms of the KEGG orthology groups. The enriched KEGG pathway `hsa04060 - Cytokine-cytokine receptor interaction`, for example, contains **19** significant differentially expressed gene.
+      
+```{r}
+# Produce the native KEGG plot (PNG)
+KEGG_pathway <- pathview(gene.data=foldchanges_ent_sig, pathway.id="hsa04060", species = "hsa")
+
+knitr::include_graphics("hsa04060.pathview.png")
+```
+      
+The <span style="color: red;"><b>red</b></span> coloured boxes are up-regulated/activated genes. On the other hand, the <span style="color: green;"><b>green</b></span> ones are down-regulated/suppressed genes.
+\
+\
+\
+       
+       
+##### 6.1.4.2. Gene Set Enrichment Analysis (GSEA):
+The GSEA aggregates the per gene statistics or log2 fold changes across genes within a gene set, then looks to see whether gene sets for particular biological pathways are enriched among the large positive or negative fold changes.
+```{r}
+gse_GO_NHBE <- gseGO(geneList = foldchanges_gene, 
+              minGSSize = 3,
+              maxGSSize    = 800,
+              pvalueCutoff = 0.01,
+              pAdjustMethod = "none",
+              keyType       = "ENSEMBL",
+              ont ="BP",
+              verbose = TRUE,
+              OrgDb = org.Hs.eg.db)
+
+gse_KEGG_NHBE <- gseKEGG(geneList = foldchanges_ent,
+              organism = "hsa",
+              minGSSize = 3,
+              maxGSSize    = 800,
+              pvalueCutoff = 0.01,
+              pAdjustMethod = "none",
+              keyType       = "ncbi-geneid")
+
+```
+
+The `dotplots` below displays biological processes through gene set enrichment analysis (GSEA) related to NHBE cells SARS-CoV-2 infected.
+
+```{r, fig.width=11}
+dotplot(gse_GO_NHBE, showCategory= 10, title = "GO biological processes related to NHBE cells SARS-CoV-2 infection", font.size = 8.5, split=".sign") + facet_grid(.~.sign) + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r, fig.width=11}
+dotplot(gse_KEGG_NHBE, showCategory = 15, title = "KEGG biological processes related to NHBE cells SARS-CoV-2 infection", font.size = 8.5, split=".sign") + facet_grid(.~.sign) + theme(plot.title = element_text(hjust = 0.5))
+```
+\
+\
+\
+
+\
+\
+
+### **6.2. Lung biopsy sample from *post mortem* COVID-19 patient**
+
+```{r}
+# Building the DESeq2 object
+remove.list <- paste(c("NHBE"), collapse = '|')
+metadata <- metadata[c(8, 7, 10, 9),]
+dds_lung_Series15 <- DESeqDataSetFromMatrix(countData = data_raw[, !grepl(remove.list, colnames(data_raw))],
+                              colData = metadata[!grepl(remove.list, metadata$type),],
+                              design = ~ condition)
+
+
+head(counts(dds_lung_Series15))
+```
+\
+     
+#### 6.2.1. Quality assessment
+This procedure checks the count data to ensure that the samples/replicates look good. For this purpose, hierarchical clustering (HC) and principal component analysis (PCA) methods were applied.
+
+```{r}
+dds <- estimateSizeFactors(dds_lung_Series15)
+#sizeFactors(dds)
+
+normalized_counts <- counts(dds, normalized=TRUE)
+```
+
+
+```{r, fig.width=9}
+dds_log <- vst(dds, blind=TRUE)
+dds_log_matrix <- assay(dds_log) # Matrix
+
+vsd_corr <- cor(dds_log_matrix)
+
+ann_colors = list(condition = c("Lung biopsy for heatly negative control" = "#bababa", "Lung sample from postmortem COVID-19 patient" = "#878787"))
+
+metadata_n <- metadata
+
+pheatmap(vsd_corr,
+         annotation = select(metadata_n, condition),
+         annotation_colors = ann_colors,
+         annotation_legend = TRUE,
+         main = "Hierarchical Clustering method \n for quality control")
+```
+\
+     
+- Overall, there are **regular correlations across the board, suggesting possible outlying samples in the COVID-19 group**. There are reasonable well-defined clusters between healthy lung biopsy and COVID-19 lung biopsy groups.
+```{r, fig.width=9}
+plotPCA(dds_log, intgroup = "condition") +
+  theme_minimal() +
+  ggtitle("Principal Component Analysis for quality control") +
+  theme(plot.title = element_text(hjust = 0.5), legend.title = element_blank())
+```
+     
+- The PC1 explains the most variation in the data (78% of variance). The healthy negative control cluster and COVID-19 lung "cluster" are separated on PC1. It seems that a lot of variation in gene expression can be explained by conditions (healthy vs COVID-19 patients).
+\
+\
+       
+> Together, **these quality controls suggest that the data are of regular quality**.
+
+\
+\
+\
+      
+#### 6.2.2. Running DESeq2 - differential expression analysis
+```{r}
+dds_lung_Series15 <- DESeq(dds_lung_Series15)
+```
+The function `DESeq()` performed the following procedures:    
+- estimating size factors     
+- estimating dispersions     
+- gene-wise dispersion estimates     
+- mean-dispersion relationship     
+- final dispersion estimates     
+- fitting model and testing     
+\
+      
+      
+`DESeq2` model uses estimated dispersion to assess the variability in expression when modelling the counts. Each black dot represents a gene. Genes with low dispersion estimates are shrunken towards the curve.
+        
+```{r}
+plotDispEsts(dds_lung_Series15, main = "Estimated dispersion for each gene and the fitted dispersion curve")
+```
+     
+> The dispersion in gene expression decreases with increasing mean. The fit of the data to the model is good since the dispersions decrease with increasing mean and cluster around the maximum likelihood (ML) line. It's expected that the data scatter around the curve, with the dispersion decreasing with increasing mean expression levels.
+
+$$↑variation ⇒ ↑dispersion$$
+$$↑mean ⇒ ↓dispersion$$
+
+\
+\
+       
+As already commented, `DESeq2` uses a negative binomial distribution to model the RNA-seq counts, and the coefficients are the estimates for the log2 foldchanges for each sample group. **To generate more accurate log2 foldchange estimates (effect size), the `DESeq2` authors recommend “shrinking” the log fold-changes which is available in `DESeq2’s` `lfcShrink` function**. The unshrunken results (1) and shrunken results (2) were performed.
+```{r}
+dds_lung_Series15_result_1 <- results(dds_lung_Series15, 
+            contrast = c("condition", "Lung sample from postmortem COVID-19 patient", "Lung biopsy for heatly negative control"),
+            alpha = 0.01)
+
+dds_lung_Series15_result_2 <- lfcShrink(dds_lung_Series15, 
+            coef= "condition_Lung.sample.from.postmortem.COVID.19.patient_vs_Lung.biopsy.for.heatly.negative.control",
+            type="apeglm")
+```
+The `MA plot` can be useful to explore the results. The log2 fold change is plotted on the y-axis, the average of the counts normalized by size factor is shown on the x-axis. Each gene is represented with a dot, and the genes that are significantly differentially expressed are coloured <span style="color: blue;"><b>blue</b></span>. 
+```{r}
+# The MA plot shows the mean of normalized count versus the log2 fold changes for all genes tested.
+plotMA(dds_lung_Series15_result_1, ylim=c(-8,8), main = "(1) MA plot for unshrunken results")
+plotMA(dds_lung_Series15_result_2, ylim=c(-8,8), main = "(2) MA plot for shrunken results")
+```
+    
+`MA plots` often display a fanning-effect at the left-hand side (genes with low numbers of counts) due to the high variability of the measurements for these genes. These plots demonstrate that only genes with a large average normalized count contain sufficient information to yield a significant call.
+
+> **The shrunken results (second plot) were more stable fold change values**. So, the shrunken results were used.
+
+\
+\
+      
+      
+#### 6.2.3. Results
+
+```{r}
+head(dds_lung_Series15_result_2)
+```
+- **baseMean:** average of the normalized count values, divided by size factors, taken over all samples. 
+- **log2FoldChange:** the effect size estimated, which is a measure describing how much the gene’s expression is different between control and infected groups. This value is reported as base 2 logarithmic scale. A log2 fold change of 1 ($\log2(FC) = 1$) means that the gene’s expression is increased by a multiplicative factor of $2^1 = 2$.
+- **lfcSE:** standard error estimated for the log2 fold change estimated.
+- **pvalue:** Wald test p-value for $p < 0.01$.
+- **padj:** false discovery rate (FDR)/Benjamini-Hochberg (BH) adjusted p-values, to control the false positives.
+
+
+```{r}
+summary(dds_lung_Series15_result_2)
+```
+> The result was **1396 (sum of LFC: log2 fold changes) genes with differential expression** of a total of 18281 with non-zero total read count. This summary represents the number of genes that are considered up- and down-regulated according to the Wald test.
+
+\
+\
+      
+Using any cut-off (padj and/or threshold values) can be helpful when dealing with large numbers of differentially expressed genes. However, it increases the risk of losing biologically relevant gene. 
+
+- By specifying a threshold equal to 1 for log2 fold change values ($\log2(FC) = 1$), then $foldchange = 2^1$ between infected and control groups for gene counts. The infected group count is twice as big as control (infected is 200% of control).
+
+- If ($\log2(FC) = -1$), then $Fold Change = 2^{-1}$ between infected and control groups for gene counts. The infected group count is half as big as control (infected is 50% of control).
+
+```{r}
+dds_lung_Series15_result_2_ <- dds_lung_Series15_result_2 %>%
+  data.frame() %>%
+  rownames_to_column(var="gene")
+
+dds_lung_Series15_result_2_sig <- dds_lung_Series15_result_2_ %>%
+        filter(padj < 0.01 & abs(log2FoldChange) > 1)
+
+nrow(dds_lung_Series15_result_2_sig)
+```
+> After applying the cut-offs $padj < 0.01$ & $abs(log2FoldChange) > 1$, **the number of significant differentially expressed genes was 342.**
+
+\
+     
+     
+```{r}
+dds_lung_Series15_result <- dds_lung_Series15_result_2_sig[order(dds_lung_Series15_result_2_sig$padj),]
+rownames(dds_lung_Series15_result) <- NULL
+as.datatable(formattable(dds_lung_Series15_result,
+                         list(
+                           log2FoldChange = color_tile("#ffffff", "#6baed6"),
+                           padj = color_tile("#74c476", "#e5f5e0"),
+                           `gene` = formatter(
+              "span", style = ~ style(color = "grey",font.weight = "bold")))))
+```
+     
+     
+```{r, fig.width=9}
+sig_norm_counts <- normalized_counts[dds_lung_Series15_result$gene, ]
+
+select <- sig_norm_counts[1:342,]
+
+ann_colors = list(condition = c("Lung biopsy for heatly negative control" = "#bababa", "Lung sample from postmortem COVID-19 patient" = "#878787"))
+pheatmap(select, 
+         cluster_rows = FALSE, 
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         border_color = NA,
+         annotation = select(metadata, condition),
+         annotation_colors = ann_colors,
+         scale = "row",
+         main = "Differential expression of the significant genes \n on lung samples from *post mortem* COVID-19 patient")
+```
+
+```{r eval=FALSE, fig.width=9, include=FALSE}
+sig_norm_counts <- normalized_counts[dds_lung_Series15_result$gene, ]
+
+select <- sig_norm_counts[1:20,]
+
+p1 <- pheatmap(select, 
+         cluster_rows = FALSE, 
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         border_color = NA,
+         annotation = select(metadata, condition),
+         annotation_colors = ann_colors,
+         scale = "row",
+         main = "Differential expression of the top 20 significant genes on lung samples \n from *post mortem* COVID-19 patient"")
+```
+\
+\
+     
+
+```{r, fig.width=9}
+# Expression plot
+sig_norm_counts <- normalized_counts[dds_lung_Series15_result$gene, ]
+
+select <- sig_norm_counts[1:20,]
+top_20 <- as.data.frame(select) %>%
+        rownames_to_column(var = "gene")
+top_20 <- gather(top_20, 
+                 key = "samplename", 
+                 value = "normalized_counts", 
+                 2:5)
+top_20 <- inner_join(top_20,      rownames_to_column(metadata, var = "samplename"),
+                     by = "samplename")
+ 
+ggplot(top_20) +
+        geom_point(aes(x = gene, y = normalized_counts, color = condition), alpha = 0.5) +
+        scale_y_log10() +
+        xlab("Genes") +
+        ylab("Normalized Counts") +
+        ggtitle("Differential expression of the top 20 significant genes") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        theme(plot.title = element_text(hjust = 0.5), legend.position = 'bottom', legend.title = element_blank())
+```
+\
+\
+\
+     
+     
+     
+The `volcano plot` shows the log-transformed adjusted p-values plotted on the y-axis and log2 fold change values on the x-axis. This plot displays a global view of the gene expression levels.
+```{r, fig.width=9}
+# Obtain logical vector regarding whether padj values are less than 0.01 and up/down regulated genes. 
+dds_lung_Series15_result_2_p <- dds_lung_Series15_result_2_ %>%
+              drop_na() %>%
+              mutate(threshold = ifelse(padj < 0.01 & log2FoldChange > 1, "Sig and Up-regulated", ifelse(padj < 0.01 & log2FoldChange < -1, "Sig and Down-regulated", "Not Sig"))) %>% mutate(genelabels = "")
+
+dds_lung_Series15_result_2_p <- dds_lung_Series15_result_2_p[order(dds_lung_Series15_result_2_p$padj),]
+dds_lung_Series15_result_2_p$genelabels[1:20] <- dds_lung_Series15_result_2_p$gene[1:20]
+
+ggplot(dds_lung_Series15_result_2_p, aes(x = log2FoldChange, y = -log10(padj), color = threshold)) +
+        geom_point(alpha=0.4, size=1.75) +
+        geom_text_repel(aes(label = genelabels)) +
+        xlab("log2 fold change") + 
+        ylab("-log10 adjusted p-value") +
+        theme(axis.title = element_text(size = rel(1.25))) +
+        theme_minimal() +
+        ggtitle("Volcano plot: adjusted p-values vs log2 fold change") +
+        theme(legend.position = 'bottom', legend.title = element_blank(), plot.title = element_text(hjust = 0.5))
+        
+```
+     
+> The `volcano plot` highlighted significant differentially expressed genes down-regulated (<span style="color: green;"><b>green</b></span>) and up-regulated (<span style="color: blue;"><b>blue</b></span>). The non-significant genes are colored <span style="color: red;"><b>red</b></span>.
+
+\
+\
+     
+```{r}
+count_results <- dds_lung_Series15_result_2_p %>%
+     group_by(threshold) %>% 
+     summarise(count = n())
+
+ggplot(count_results, aes(x=threshold, y=count)) +
+  geom_bar(aes(fill=threshold), stat = 'identity', alpha = 0.7, width = 0.4) +
+  geom_text(aes(label=count), vjust=-0.5, color="black", size=3.2) +
+  ggtitle("Count of differentially expressed genes") +
+  theme_minimal() +
+    theme(legend.title = element_blank(), plot.title =
+          element_text(hjust = 0.5), axis.title.x = element_blank())
+```
+     
+> The output of RNA-seq differential expression analysis is a list of significant differentially expressed genes. In this analysis, in which was explored the differential expression in lung biopsy sample from *post mortem* COVID-19 patient, **342 significant differentially expressed genes** (<span style="color: green;"><b>83 down-regulated</b></span> and <span style="color: blue;"><b>259 up-regulated</b></span>) were identified.
+
+\
+\
+       
+        
+#### 6.2.4. Functional Analysis
+
+To gain greater biological insight into the list of differentially expressed genes, it is helpful to perform functional analysis. The two commonly used enrichment methods are: Over-Representation Analysis (ORA); and Gene Set Enrichment Analysis (GSEA).
+
+To perform the functional analysis the Gene Ontology (GO) and Kyoto Encyclopedia of Genes and Genomes (KEGG) were used for the enrichment analysis with the objective to identify biological processes and pathways.
+       
+- Gene ontology (GO) provides a controlled vocabulary for describing biological processes, molecular functions and cellular components.
+     
+- KEGG groups genes into "pathways" representing molecular interaction and reaction networks, which are basically lists of genes participating in the same biological process. 
+```{r include=FALSE}
+#PREPARING THE DATA
+dds_lung_results <- dds_lung_Series15_result_2 %>%
+  data.frame() %>%
+  rownames_to_column(var="gene")
+
+ensembl = useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+
+grch_genes <- getBM(attributes=c("ensembl_gene_id", "hgnc_symbol", "entrezgene_id", "description"), mart = ensembl)
+names(grch_genes)[2] <- "gene"
+
+dds_lung_results <- left_join(x = dds_lung_results, 
+                    y = grch_genes[, c("ensembl_gene_id", "gene", "entrezgene_id", "description")], 
+                    by = "gene")
+
+dds_lung_results <- dds_lung_results[!duplicated(dds_lung_results$gene),]
+
+dds_lung_results <- dds_lung_results[!duplicated(dds_lung_results$entrezgene_id),]
+
+dds_lung_results <- dds_lung_results %>% # all results
+  drop_na()
+
+dds_lung_results_sig <- dplyr::filter(dds_lung_results, padj < 0.01 & abs(log2FoldChange) > 1) # significant results and log2FoldChange threshold
+
+## EXTRACTING THE FOLD CHANGES FOR GO ANALYSIS
+# FOR ALL RESULTS WITH GENE ID
+foldchanges_gene <- dds_lung_results$log2FoldChange
+names(foldchanges_gene) <- dds_lung_results$ensembl_gene_id
+foldchanges_gene <- sort(foldchanges_gene, decreasing = TRUE)
+
+# FOR SIGNIFICANT RESULTS WITH GENE ID
+foldchanges_gene_sig <- dds_lung_results_sig$log2FoldChange
+names(foldchanges_gene_sig) <- dds_lung_results_sig$ensembl_gene_id
+foldchanges_gene_sig <- sort(foldchanges_gene_sig, decreasing = TRUE)
+
+## EXTRACTING THE FOLD CHANGES FOR KEGG ANALYSIS
+# FOR ALL RESULTS WITH ENTREZ ID
+foldchanges_ent <- dds_lung_results$log2FoldChange
+names(foldchanges_ent) <- dds_lung_results$entrezgene_id
+foldchanges_ent <- sort(foldchanges_ent, decreasing = TRUE)
+
+# FOR SIGNIFICANT RESULTS WITH ENTREZ ID
+foldchanges_ent_sig <- dds_lung_results_sig$log2FoldChange
+names(foldchanges_ent_sig) <- dds_lung_results_sig$entrezgene_id
+foldchanges_ent_sig <- sort(foldchanges_ent_sig, decreasing = TRUE)
+
+```
+\
+\
+       
+       
+##### 6.2.4.1. Over-representation analysis (ORA)
+It is an approach to determine whether a known biological functions/processes are over-represented (= enriched) in a list of differentially expressed genes.
+```{r}
+GO_lung <- enrichGO(gene = as.character(dds_lung_results_sig$ensembl_gene_id),
+                    universe = as.character(dds_lung_results$ensembl_gene_id),
+                    keyType = "ENSEMBL",
+                    OrgDb = org.Hs.eg.db, 
+                    ont = "BP",
+                    pAdjustMethod = "BH",
+                    pvalueCutoff = 0.01,
+                    qvalueCutoff = 0.1, 
+                    readable = TRUE)
+
+cluster_summary_GO_lung <- data.frame(GO_lung)
+nrow(cluster_summary_GO_lung)
+
+KEGG_lung <- enrichKEGG(gene=names(foldchanges_ent_sig),
+                        universe=names(foldchanges_ent),
+                        organism="hsa",
+                        pAdjustMethod = "BH",
+                        pvalueCutoff = 0.01,
+                        qvalueCutoff = 0.1,
+                        keyType = "ncbi-geneid")
+
+cluster_summary_KEGG_lung <- data.frame(KEGG_lung)
+nrow(cluster_summary_KEGG_lung)
+```
+> The GO functional enrichment analysis of differentially expressed genes returned **184 classes**. The ID GO:0098542, for example, is a class with the description: defense response to other organism.
+       
+> The KEGG functional enrichment analysis returned **6 categories**. The ID hsa04060, for example, is a category with the description: Cytokine-cytokine receptor interaction.
+
+\
+\
+      
+The `dotplot` displays the top 20 GO and KEGG biological processes with the largest gene ratios (*number of differentially expressed genes related to GO term / total number of significant differentially expressed genes*). The size of the dots represent the number of genes in the significant differentially expressed gene list associated with the GO term and the colour of the dots represent the p-adjusted values.
+```{r, fig.width=12}
+p1 <- dotplot(GO_lung, showCategory = 20, title = "Gene Ontology", font.size = 8.5) + theme(plot.title = element_text(hjust = 0.5))
+
+p2 <- dotplot(KEGG_lung, 
+        showCategory = 20,
+        title = "KEGG",
+        font.size = 8.5) + theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2, ncol=2, top = textGrob("Biological processes related to lung samples from *post mortem* COVID-19 patient", gp=gpar(fontsize=15)))
+```
+\
+\
+\
+        
+        
+The `heatplot` shows the GO functional enrichment analysis of differentially expressed genes. The colour of the squares represents the fold change values.
+
+```{r, fig.width=7, fig.height=20}
+heatplot(GO_lung, foldChange=foldchanges_gene_sig, showCategory = 20) + ggtitle("Gene expression on GO biological processes related to \n lung samples from *post mortem* COVID-19 patient") + theme(plot.title = element_text(hjust = 0.5)) + coord_flip()
+```
+\
+\
+       
+       
+The `enrichment plot` shows the relationship between the significantly enriched GO terms by grouping similar terms together. The colour represents the p-adjusted values and the size of the terms represents the number of genes identified that are significant.
+     
+```{r, fig.width=11}
+emapplot(GO_lung, showCategory = 20, pie_scale=1.5,layout="kk", line_scale = 0.3) + ggtitle("Biological processes relationship between the significantly enriched GO terms") + theme(plot.title = element_text(hjust = 0.5))
+```
+\
+\
+\
+      
+      
+The `KEGG pathway map` is a molecular interaction/reaction network diagram represented in terms of the KEGG orthology groups. The enriched KEGG pathway `hsa04061 - Viral protein interaction with cytokine and cytokine receptor`, for example, contains **13** significant differentially expressed gene.
+      
+```{r}
+# Produce the native KEGG plot (PNG)
+KEGG_pathway <- pathview(gene.data=foldchanges_ent_sig, pathway.id="hsa04061", species = "hsa")
+
+knitr::include_graphics("hsa04061.pathview.png")
+```
+      
+The <span style="color: red;"><b>red</b></span> colored boxes are up-regulated/activated genes. On the other hand, the <span style="color: green;"><b>green</b></span> ones are down-regulated/suppressed genes.
+\
+\
+\
+       
+       
+##### 6.2.4.2. Gene Set Enrichment Analysis (GSEA):
+The GSEA aggregates the per gene statistics or log2 fold changes across genes within a gene set, then looks to see whether gene sets for particular biological pathways are enriched among the large positive or negative fold changes.
+```{r}
+gse_GO_lung <- gseGO(geneList = foldchanges_gene, 
+              minGSSize = 3,
+              maxGSSize    = 800,
+              pvalueCutoff = 0.01,
+              pAdjustMethod = "none",
+              keyType       = "ENSEMBL",
+              ont ="BP",
+              verbose = TRUE,
+              OrgDb = org.Hs.eg.db)
+
+gse_KEGG_lung <- gseKEGG(geneList = foldchanges_ent,
+              organism = "hsa",
+              minGSSize = 3,
+              maxGSSize    = 800,
+              pvalueCutoff = 0.01,
+              pAdjustMethod = "none",
+              keyType       = "ncbi-geneid")
+
+```
+
+The `dotplots` below displays biological processes through gene set enrichment analysis (GSEA) related to lung samples from *post mortem* COVID-19 patient.
+
+```{r, fig.width=11}
+dotplot(gse_GO_lung, showCategory= 10, title = "GO biological processes related to lung samples from *post mortem* COVID-19 patient", font.size = 8.5, split=".sign") + facet_grid(.~.sign) + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r, fig.width=11}
+dotplot(gse_KEGG_lung, showCategory = 15, title = "KEGG biological processes related to lung samples from *post mortem* COVID-19 patient", font.size = 8.5, split=".sign") + facet_grid(.~.sign) + theme(plot.title = element_text(hjust = 0.5))
+```
+
+---
+***
+***
+
+## 7. Comparing NHBE cells and lung biopsy samples results
+
+The top 6 GO functional enrichment analysis of differentially expressed genes of NHBE cells infected with SARS-CoV-2 and lung biopsy samples from *post mortem* COVID-19 patient were compared.
+
+```{r}
+bind_GO <- cbind(cluster_summary_GO[1:6,1:2], cluster_summary_GO_lung[1:6,1:2])
+rownames(bind_GO) <- NULL
+colnames(bind_GO) <- c("ID.NHBE", "Description.NHBE", "ID.Lung", "Description.Lung")
+bind_GO
+
+formattable(bind_GO, list(area(row = 3, col = 1:2) ~ color_tile("#80b1d3", "#80b1d3"),
+            area(row = 1, col = 3:4) ~ color_tile("#80b1d3", "#80b1d3")))
+```
+
+```{r}
+bind_KEGG <- cbind(cluster_summary_KEGG[1:6,1:2],
+cluster_summary_KEGG_lung[1:6,1:2])
+rownames(bind_KEGG) <- NULL
+colnames(bind_KEGG) <- c("ID.NHBE", "Description.NHBE", "ID.Lung", "Description.Lung")
+bind_KEGG
+
+formattable(bind_KEGG, list(area(row = 1, col = 1:4) ~ color_tile("#7fc97f", "#7fc97f"),
+            area(row = 2, col = 1:2) ~ color_tile("#beaed4", "#beaed4"),
+            area(row = 5, col = 3:4) ~ color_tile("#beaed4", "#beaed4"),
+            area(row = 5, col = 1:2) ~ color_tile("#fdc086", "#fdc086"),
+            area(row = 2, col = 3:4) ~ color_tile("#fdc086", "#fdc086"),
+            area(row = 6, col = 1:4) ~ color_tile("#ffff99", "#ffff99")))
+```
+\
+\
+
+Finally, **the common significant differentially expressed genes** between NHBE cells infected with SARS-CoV-2 and lung biopsy sample from *post mortem* COVID-19 patient were analysed.
+
+```{r}
+NHBEvslung_gene <- inner_join(dds_NHBE_results_sig, dds_lung_results_sig, suffix = c(".NHBE", ".lung"), by="gene")
+NHBEvslung_gene_sub <- NHBEvslung_gene[, c(1, 3, 6, 11, 14, 17)]
+NHBEvslung_gene_sub$description.lung <- gsub(" \\[.*","",NHBEvslung_gene_sub$description.lung)
+colnames(NHBEvslung_gene_sub)[6] <- "description"
+
+formattable(NHBEvslung_gene_sub,
+                         list(
+                           log2FoldChange.NHBE = color_tile("#e0f3f8", "#4575b4"),
+                           padj.NHBE = color_tile("#8073ac", "#d8daeb"),
+                           log2FoldChange.lung = color_tile("#e0f3f8", "#4575b4"),
+                           padj.lung = color_tile("#e08214", "#fee0b6"),
+                           `gene` = formatter(
+              "span", style = ~ style(color = "grey",font.weight = "bold"))))
+
+
+```
+> 17 genes are common in NHBE cells infected with SARS-CoV-2 and lung biopsy sample from post mortem COVID-19 patient experiments, of which 15 genes are up-regulated/activated in both.
+
+\
+\
+
+These **15 genes in common** were then grouped into KEGG biological processes.
+
+```{r}
+dds_lung_results_sub <- dds_lung_results %>%
+  filter(
+  gene %in% c("IFI6", "GBP5", "S100A9", "S100A12", "S100A8", "IFITM1", "OAS1" , "OAS3", "OAS2", "C15orf48", "BCL2A1", "TNFSF14", "MX2", "MX1" , "TNF"))
+
+## EXTRACTING THE FOLD CHANGES FOR KEGG ANALYSIS
+foldchanges_ent_sub <- dds_lung_results_sub$log2FoldChange
+names(foldchanges_ent_sub) <- dds_lung_results_sub$entrezgene_id
+foldchanges_ent_sub <- sort(foldchanges_ent_sub, decreasing = TRUE)
+
+gse_KEGG_com <- gseKEGG(geneList = foldchanges_ent_sub,
+              organism = "hsa",
+              minGSSize = 3,
+              maxGSSize    = 100,
+              pvalueCutoff = "none",
+              pAdjustMethod = "none",
+              keyType       = "ncbi-geneid")
+
+dotplot(gse_KEGG_com, title = "KEGG biological processes of the common \n significant differentially expressed genes", font.size = 8.5, split=".sign") + facet_grid(.~.sign) + theme(plot.title = element_text(hjust = 0.5))
+
+```
+\
+\
+
+The  KEGG pathway `hsa04621 - NOD-like receptor signalling pathway`, for example, contains **5** common differentially expressed genes. This pathway activates downstream molecules (such as NF-κB) through signal transduction to mediate the production of **pro-inflammatory cytokines**.
+```{r}
+KEGG_pathway <- pathview(gene.data=foldchanges_ent_sub, pathway.id="hsa04621", species = "hsa")
+
+knitr::include_graphics("hsa04621.pathview.png")
+```
+\
+\
+
+## 8. Conclusion
+
+The current project analysed the transcriptional response using RNA sequencing to cell model of SARS-CoV-2 infection and COVID-19 lung biopsy. The methods and tools applied suggested genes/pathways that may be involved SARS-CoV-2 infection, however, it is recommended to perform experimental validation of any suggested pathways.
+\
+\
+
+> Overall, the results revealed a **cascade of inflammatory responses** mediated by pathways such as cell chemotaxis, cytokine-cytokine receptor interaction, cytokine production and NOD-like receptor signalling pathway.
+
+\
+
+## 9. References
+
+`RNA-seq dataset`:
+Daniel Blanco-Melo, Benjamin E. Nilsson-Payant, Wen-Chun Liu, Rasmus Møller, Maryline Panis, David Sachs, Randy A. Albrecht, Benjamin R. tenOever. SARS-CoV-2 launches a unique transcriptional signature from in vitro, ex vivo, and in vivo systems  bioRxiv 2020.03.24.004655; doi: https://doi.org/10.1101/2020.03.24.004655 / https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE147507
+
+`DESeq2`package:
+Love MI, Huber W, Anders S (2014). “Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2.” Genome Biology, 15, 550. doi: 10.1186/s13059-014-0550-8.
+
+`clusterProfiler` package:
+Guangchuang Yu, Li-Gen Wang, Yanyan Han and Qing-Yu He.
+  clusterProfiler: an R package for comparing biological themes among
+  gene clusters. OMICS: A Journal of Integrative Biology
+  2012, 16(5):284-287
+  
+`DOSE` package:
+Guangchuang Yu, Li-Gen Wang, Guang-Rong Yan, Qing-Yu He.
+  DOSE: an  R/Bioconductor package for Disease Ontology Semantic and Enrichment analysis. Bioinformatics 2015, 31(4):608-609
+
+`pathview` package:
+Luo, W. and Brouwer C.,
+  Pathview: an R/Bioconductor package for pathway-based data integration and
+  visualization. Bioinformatics, 2013, 29(14):
+  1830-1831, doi: 10.1093/bioinformatics/btt285
+  
+`apeglm` for LFC shrinkage:
+Zhu, A., Ibrahim, J.G., Love, M.I. (2018) Heavy-tailed prior distributions for sequence count data: removing the noise and preserving large differences. Bioinformatics. https://doi.org/10.1093/bioinformatics/bty895
+
+`biomaRt` package:
+Durinck S, Spellman P, Birney E, Huber W (2009). “Mapping identifiers for the integration of genomic datasets with the R/Bioconductor package biomaRt.” Nature Protocols, 4, 1184–1191.
+
+Durinck S, Moreau Y, Kasprzyk A, Davis S, De Moor B, Brazma A, Huber W (2005). “BioMart and Bioconductor: a powerful link between biological databases and microarray data analysis.” Bioinformatics, 21, 3439–3440.
+
+`org.Hs.eg.db` package:
+Marc Carlson (2020). org.Hs.eg.db: Genome wide annotation for Human. R package version 3.11.1.
+
+`GEOquery` package:
+Davis S, Meltzer P (2007). “GEOquery: a bridge between the Gene Expression Omnibus (GEO) and BioConductor.” Bioinformatics, 14, 1846–1847.
